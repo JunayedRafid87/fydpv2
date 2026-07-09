@@ -241,11 +241,10 @@ class ScanToPointCloud(Node):
             aligned_cloud = pc2.create_cloud(cloud_in_target_frame.header, self.map_fields, aligned_points)
             self.cloud_pub.publish(aligned_cloud)
 
-            # 4. Accumulate and voxel-filter points
+            # 4. Accumulate and voxel-filter points (always maps to build continuous 2D floor plan hallways while moving)
             should_map = True
             if self.enable_motion_gating and self.is_moving:
-                should_map = False
-                self.get_logger().info("Mapping paused (Rover is moving)", throttle_duration_sec=5.0)
+                self.get_logger().info("2D Odometry Mapping (Rover is moving...)", throttle_duration_sec=5.0)
 
             if should_map:
                 for p in aligned_points:
