@@ -11,6 +11,8 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan, PointCloud2, PointField
 from std_msgs.msg import Bool
+from std_srvs.srv import Trigger
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from tf2_ros import Buffer, TransformListener
 from laser_geometry import LaserProjection
 import tf2_sensor_msgs
@@ -74,6 +76,10 @@ class ScanToPointCloud(Node):
             Bool, '/moving', self.moving_callback, 10)
         self.is_moving = False
 
+        # Subscribe to RViz 2D Pose Estimate for manual initial alignment
+        self.initialpose_sub = self.create_subscription(
+            PoseWithCovarianceStamped, '/initialpose', self.initialpose_callback, 10)
+
         # Service to clear/delete the accumulated map
         self.clear_service = self.create_service(
             Trigger, '/clear_map', self.clear_map_callback)
@@ -98,6 +104,25 @@ class ScanToPointCloud(Node):
         response.success = True
         response.message = "Map and alignment offsets cleared."
         return response
+
+    def initialpose_callback(self, msg):
+        # Extract X and Y position
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
+        
+        # Convert orientation quaternion to Yaw angle
+        q = msg.pose.pose.orientation
+        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        
+        self.auto_x_offset = x
+        self.auto_y_offset = y
+        self.auto_yaw_offset = yaw
+        
+        self.get_logger().info(
+            f"Reset tracking origin from 2D Pose Estimate: x={x:.3f}m, y={y:.3f}m, yaw={math.degrees(yaw):.2f}°"
+        )
 
     def moving_callback(self, msg):
         # Trigger alignment search when transitioned from moving to stationary

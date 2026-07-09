@@ -31,13 +31,12 @@ def generate_launch_description():
         ),
 
         # ── 2. Static TF: tilt_link → laser ──
+        #    Old-style positional args for Humble: x y z yaw pitch roll frame_id child_frame_id
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
             name='tilt_to_laser_tf',
-            arguments=['--x', '0.0', '--y', '0.0', '--z', '0.0',
-                       '--roll', '0.0', '--pitch', '0.0', '--yaw', '0.0',
-                       '--frame-id', 'tilt_link', '--child-frame-id', 'laser'],
+            arguments=['0', '0', '0', '0', '0', '0', 'tilt_link', 'laser'],
         ),
 
         # ── 3. Static TF: base_link → thermal_camera_link ──
@@ -45,9 +44,7 @@ def generate_launch_description():
             package='tf2_ros',
             executable='static_transform_publisher',
             name='base_to_camera_tf',
-            arguments=['--x', '0.05', '--y', '0.0', '--z', '0.10',
-                       '--roll', '0.0', '--pitch', '0.0', '--yaw', '0.0',
-                       '--frame-id', 'base_link', '--child-frame-id', 'thermal_camera_link'],
+            arguments=['0.05', '0', '0.10', '0', '0', '0', 'base_link', 'thermal_camera_link'],
         ),
 
         # ── 4. Tilt Angle and Orientation TF Broadcaster ──

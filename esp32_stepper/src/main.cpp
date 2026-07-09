@@ -111,8 +111,8 @@ void loop() {
         double gyro_mag = sqrt(gyro.x()*gyro.x() + gyro.y()*gyro.y() + gyro.z()*gyro.z());
         double acc_mag = sqrt(linear_acc.x()*linear_acc.x() + linear_acc.y()*linear_acc.y() + linear_acc.z()*linear_acc.z());
 
-        // Gyro > 5.0 deg/s (completely ignores accelerometer offsets and stepper hum when stationary)
-        motionDetected = (gyro_mag > 5.0);
+        // Gyro > 5.0 deg/s OR linear accel > 0.8 m/s² (gravity-compensated)
+        motionDetected = (gyro_mag > 5.0) || (acc_mag > 0.8);
     }
 
     if (motionDetected) {
