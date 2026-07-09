@@ -167,18 +167,20 @@ class ScanToPointCloud(Node):
                 )
             ]
 
-            # Perform automatic 2D projected scan-matching tracking (Laser Odometry) on every scan
-            if self.map_points_2d:
+            # Perform automatic 2D projected scan-matching alignment (once when transitioning from moving to stationary)
+            if not self.is_moving and self.needs_alignment and self.map_points_2d:
+                self.needs_alignment = False
+                
                 best_dx = self.auto_x_offset
                 best_dy = self.auto_y_offset
                 best_dtheta = self.auto_yaw_offset
                 max_matches = -1
-                sub_points = raw_points[::10]  # Subsample heavily for 15 Hz tracking speed
+                sub_points = raw_points[::8]  # Subsample for speed
 
-                # Coarse 2D Search: search +/-16cm (4cm steps) and +/-6 deg (2 deg steps)
-                coarse_dxs = [self.auto_x_offset + x * 0.04 for x in range(-4, 5)]
-                coarse_dys = [self.auto_y_offset + y * 0.04 for y in range(-4, 5)]
-                coarse_yaws = [self.auto_yaw_offset + math.radians(deg) for deg in range(-6, 7, 2)]
+                # Coarse 2D Search: search +/- 0.8m (8cm steps) and +/- 20 deg (4 deg steps)
+                coarse_dxs = [self.auto_x_offset + x * 0.08 for x in range(-10, 11)]
+                coarse_dys = [self.auto_y_offset + y * 0.08 for y in range(-10, 11)]
+                coarse_yaws = [self.auto_yaw_offset + math.radians(deg) for deg in range(-20, 21, 4)]
 
                 coarse_best_dx = self.auto_x_offset
                 coarse_best_dy = self.auto_y_offset
@@ -187,6 +189,7 @@ class ScanToPointCloud(Node):
                 for dyaw in coarse_yaws:
                     cos_a = math.cos(dyaw)
                     sin_a = math.sin(dyaw)
+                    # Pre-calculate rotated coordinates to boost loop execution speed
                     rotated_pts = []
                     for p in sub_points:
                         x, y, _, _ = p
@@ -210,10 +213,10 @@ class ScanToPointCloud(Node):
                                 coarse_best_dy = dy
                                 coarse_best_yaw = dyaw
 
-                # Fine 2D Search: search +/-3cm (1cm steps) and +/-1.5 deg (0.5 deg steps) around coarse candidate
-                fine_dxs = [coarse_best_dx + x * 0.01 for x in range(-3, 4)]
-                fine_dys = [coarse_best_dy + y * 0.01 for y in range(-3, 4)]
-                fine_yaws = [coarse_best_yaw + math.radians(deg_half * 0.5) for deg_half in range(-3, 4)]
+                # Fine 2D Search: search +/- 10cm (2cm steps) and +/- 3.0 deg (1.0 deg steps) around coarse candidate
+                fine_dxs = [coarse_best_dx + x * 0.02 for x in range(-5, 6)]
+                fine_dys = [coarse_best_dy + y * 0.02 for y in range(-5, 6)]
+                fine_yaws = [coarse_best_yaw + math.radians(deg) for deg in range(-3, 4)]
 
                 max_matches = -1
                 for dyaw in fine_yaws:
@@ -242,15 +245,18 @@ class ScanToPointCloud(Node):
                                 best_dy = dy
                                 best_dtheta = dyaw
 
-                # Apply tracking update if sufficient overlap is found (e.g. at least 6 points matched in 2D)
-                if max_matches >= 6:
+                # Apply tracking update if sufficient overlap is found (e.g. at least 12 points matched in 2D)
+                if max_matches >= 12:
                     self.auto_x_offset = best_dx
                     self.auto_y_offset = best_dy
                     self.auto_yaw_offset = best_dtheta
                     self.get_logger().info(
-                        f"Odometry tracking: x={self.auto_x_offset:.2f}m, y={self.auto_y_offset:.2f}m, "
-                        f"yaw={math.degrees(self.auto_yaw_offset):.1f}° (overlap: {max_matches} points)",
-                        throttle_duration_sec=1.0
+                        f"Auto-aligned scan: dx={best_dx:.3f}m, dy={best_dy:.3f}m, yaw={math.degrees(best_dtheta):.2f}° "
+                        f"(matched {max_matches} points with existing map)"
+                    )
+                else:
+                    self.get_logger().info(
+                        f"Auto-alignment skipped: only {max_matches} matches (needs >=12)"
                     )
 
             # Apply cumulative alignment offset (X, Y translation and Yaw rotation)
