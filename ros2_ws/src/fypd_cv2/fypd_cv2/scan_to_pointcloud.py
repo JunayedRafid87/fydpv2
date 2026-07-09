@@ -59,6 +59,7 @@ class ScanToPointCloud(Node):
         # Storage for voxel-filtered accumulated map points
         # key: (vx, vy, vz), value: [x, y, z, intensity, hit_count]
         self.map_points = {}
+        self.map_points_2d = set()  # 2D projection set of occupied keys: (vx, vy)
         self.scan_count = 0
 
         # Subscribe to 2D scan, publish 3D cloud (individual scans)
@@ -98,6 +99,7 @@ class ScanToPointCloud(Node):
 
     def clear_map_callback(self, request, response):
         self.map_points = {}
+        self.map_points_2d = set()
         self.auto_yaw_offset = 0.0
         self.auto_x_offset = 0.0
         self.auto_y_offset = 0.0
@@ -165,40 +167,74 @@ class ScanToPointCloud(Node):
                 )
             ]
 
-            # Perform automatic scan-matching tracking (Laser Odometry) on every scan
-            if self.map_points:
+            # Perform automatic 2D projected scan-matching tracking (Laser Odometry) on every scan
+            if self.map_points_2d:
                 best_dx = self.auto_x_offset
                 best_dy = self.auto_y_offset
                 best_dtheta = self.auto_yaw_offset
                 max_matches = -1
-                sub_points = raw_points[::10]  # Subsample heavily for 15 Hz real-time tracking speed
+                sub_points = raw_points[::10]  # Subsample heavily for 15 Hz tracking speed
 
-                # Search range: X/Y translation +/- 8cm (2cm steps), Yaw rotation +/- 4.0 deg (1.0 deg steps)
-                search_dxs = [self.auto_x_offset + x * 0.02 for x in range(-4, 5)]
-                search_dys = [self.auto_y_offset + y * 0.02 for y in range(-4, 5)]
-                search_yaws = [self.auto_yaw_offset + math.radians(deg) for deg in range(-4, 5)]
+                # Coarse 2D Search: search +/-16cm (4cm steps) and +/-6 deg (2 deg steps)
+                coarse_dxs = [self.auto_x_offset + x * 0.04 for x in range(-4, 5)]
+                coarse_dys = [self.auto_y_offset + y * 0.04 for y in range(-4, 5)]
+                coarse_yaws = [self.auto_yaw_offset + math.radians(deg) for deg in range(-6, 7, 2)]
 
-                for dyaw in search_yaws:
+                coarse_best_dx = self.auto_x_offset
+                coarse_best_dy = self.auto_y_offset
+                coarse_best_yaw = self.auto_yaw_offset
+
+                for dyaw in coarse_yaws:
                     cos_a = math.cos(dyaw)
                     sin_a = math.sin(dyaw)
-                    # Pre-calculate rotated coordinates to boost loop execution speed
                     rotated_pts = []
                     for p in sub_points:
-                        x, y, z, _ = p
+                        x, y, _, _ = p
                         rx_rot = x * cos_a - y * sin_a
                         ry_rot = x * sin_a + y * cos_a
-                        rotated_pts.append((rx_rot, ry_rot, z))
+                        rotated_pts.append((rx_rot, ry_rot))
 
-                    for dx in search_dxs:
-                        for dy in search_dys:
+                    for dx in coarse_dxs:
+                        for dy in coarse_dys:
                             matches = 0
-                            for rx_rot, ry_rot, z in rotated_pts:
+                            for rx_rot, ry_rot in rotated_pts:
                                 rx = rx_rot + dx
                                 ry = ry_rot + dy
                                 vx = int(rx / self.voxel_size)
                                 vy = int(ry / self.voxel_size)
-                                vz = int(z / self.voxel_size)
-                                if (vx, vy, vz) in self.map_points:
+                                if (vx, vy) in self.map_points_2d:
+                                    matches += 1
+                            if matches > max_matches:
+                                max_matches = matches
+                                coarse_best_dx = dx
+                                coarse_best_dy = dy
+                                coarse_best_yaw = dyaw
+
+                # Fine 2D Search: search +/-3cm (1cm steps) and +/-1.5 deg (0.5 deg steps) around coarse candidate
+                fine_dxs = [coarse_best_dx + x * 0.01 for x in range(-3, 4)]
+                fine_dys = [coarse_best_dy + y * 0.01 for y in range(-3, 4)]
+                fine_yaws = [coarse_best_yaw + math.radians(deg_half * 0.5) for deg_half in range(-3, 4)]
+
+                max_matches = -1
+                for dyaw in fine_yaws:
+                    cos_a = math.cos(dyaw)
+                    sin_a = math.sin(dyaw)
+                    rotated_pts = []
+                    for p in sub_points:
+                        x, y, _, _ = p
+                        rx_rot = x * cos_a - y * sin_a
+                        ry_rot = x * sin_a + y * cos_a
+                        rotated_pts.append((rx_rot, ry_rot))
+
+                    for dx in fine_dxs:
+                        for dy in fine_dys:
+                            matches = 0
+                            for rx_rot, ry_rot in rotated_pts:
+                                rx = rx_rot + dx
+                                ry = ry_rot + dy
+                                vx = int(rx / self.voxel_size)
+                                vy = int(ry / self.voxel_size)
+                                if (vx, vy) in self.map_points_2d:
                                     matches += 1
                             if matches > max_matches:
                                 max_matches = matches
@@ -206,7 +242,7 @@ class ScanToPointCloud(Node):
                                 best_dy = dy
                                 best_dtheta = dyaw
 
-                # Apply tracking updates only if a solid scan overlap match is found
+                # Apply tracking update if sufficient overlap is found (e.g. at least 6 points matched in 2D)
                 if max_matches >= 6:
                     self.auto_x_offset = best_dx
                     self.auto_y_offset = best_dy
@@ -278,6 +314,7 @@ class ScanToPointCloud(Node):
                         
                         # Add new voxel point with hit count = 1
                         self.map_points[key] = [float(x), float(y), float(z), float(intensity), 1]
+                        self.map_points_2d.add((vx, vy))
 
             # 5. Periodically publish the accumulated map (every 10 scans)
             self.scan_count += 1
