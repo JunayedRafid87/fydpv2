@@ -45,9 +45,10 @@ class ScanToPointCloud(Node):
         # TF2 buffer and listener
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        # Yaw alignment calibration variables
+        # Yaw and translation alignment calibration variables
         self.auto_yaw_offset = 0.0
+        self.auto_x_offset = 0.0
+        self.auto_y_offset = 0.0
         self.needs_alignment = False
 
         # Laser projection utility
@@ -73,6 +74,10 @@ class ScanToPointCloud(Node):
             Bool, '/moving', self.moving_callback, 10)
         self.is_moving = False
 
+        # Service to clear/delete the accumulated map
+        self.clear_service = self.create_service(
+            Trigger, '/clear_map', self.clear_map_callback)
+
         # Define PointCloud2 fields
         self.map_fields = [
             PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
@@ -84,6 +89,15 @@ class ScanToPointCloud(Node):
         self.get_logger().info('ScanToPointCloud node started')
         self.get_logger().info(f'Projecting scans into frame: {self.target_frame}')
         self.get_logger().info(f'Voxel filter resolution set to: {self.voxel_size}m')
+
+    def clear_map_callback(self, request, response):
+        self.map_points = {}
+        self.auto_yaw_offset = 0.0
+        self.auto_x_offset = 0.0
+        self.auto_y_offset = 0.0
+        response.success = True
+        response.message = "Map and alignment offsets cleared."
+        return response
 
     def moving_callback(self, msg):
         # Trigger alignment search when transitioned from moving to stationary
@@ -129,52 +143,106 @@ class ScanToPointCloud(Node):
             # Perform automatic scan-matching correlation alignment (once when stopping)
             if not self.is_moving and self.needs_alignment and self.map_points:
                 self.needs_alignment = False
-                best_phi = 0.0
+                
+                best_dx = self.auto_x_offset
+                best_dy = self.auto_y_offset
+                best_dtheta = self.auto_yaw_offset
                 max_matches = -1
-                sub_points = raw_points[::4]  # Subsample for speed
+                sub_points = raw_points[::6]  # Subsample for speed
 
-                # Search range: -10 to +10 degrees in steps of 0.5 degrees
-                for deg_half in range(-20, 21):
-                    rad = math.radians(deg_half * 0.5)
-                    matches = 0
-                    cos_a = math.cos(rad)
-                    sin_a = math.sin(rad)
-                    
+                # Coarse Search: Search X/Y within last_offset +- 0.2m in 4cm steps, Yaw last_yaw +- 10 deg in 2.0 deg steps
+                coarse_dxs = [self.auto_x_offset + x * 0.04 for x in range(-5, 6)]
+                coarse_dys = [self.auto_y_offset + y * 0.04 for y in range(-5, 6)]
+                coarse_yaws = [self.auto_yaw_offset + math.radians(deg) for deg in range(-10, 11, 2)]
+
+                coarse_best_dx = self.auto_x_offset
+                coarse_best_dy = self.auto_y_offset
+                coarse_best_yaw = self.auto_yaw_offset
+
+                for dyaw in coarse_yaws:
+                    cos_a = math.cos(dyaw)
+                    sin_a = math.sin(dyaw)
+                    # Pre-calculate rotated coordinates to boost loop execution speed
+                    rotated_pts = []
                     for p in sub_points:
                         x, y, z, _ = p
-                        rx = x * cos_a - y * sin_a
-                        ry = x * sin_a + y * cos_a
-                        vx = int(rx / self.voxel_size)
-                        vy = int(ry / self.voxel_size)
-                        vz = int(z / self.voxel_size)
-                        neighbor_key = (vx, vy, vz)
-                        if neighbor_key in self.map_points:
-                            matches += 1
-                    
-                    if matches > max_matches:
-                        max_matches = matches
-                        best_phi = rad
-                
+                        rx_rot = x * cos_a - y * sin_a
+                        ry_rot = x * sin_a + y * cos_a
+                        rotated_pts.append((rx_rot, ry_rot, z))
+
+                    for dx in coarse_dxs:
+                        for dy in coarse_dys:
+                            matches = 0
+                            for rx_rot, ry_rot, z in rotated_pts:
+                                rx = rx_rot + dx
+                                ry = ry_rot + dy
+                                vx = int(rx / self.voxel_size)
+                                vy = int(ry / self.voxel_size)
+                                vz = int(z / self.voxel_size)
+                                if (vx, vy, vz) in self.map_points:
+                                    matches += 1
+                            if matches > max_matches:
+                                max_matches = matches
+                                coarse_best_dx = dx
+                                coarse_best_dy = dy
+                                coarse_best_yaw = dyaw
+
+                # Fine Search: Search X/Y within coarse_best +- 0.03m in 1cm steps, Yaw coarse_best_yaw +- 1.5 deg in 0.5 deg steps
+                fine_dxs = [coarse_best_dx + x * 0.01 for x in range(-3, 4)]
+                fine_dys = [coarse_best_dy + y * 0.01 for y in range(-3, 4)]
+                fine_yaws = [coarse_best_yaw + math.radians(deg_half * 0.5) for deg_half in range(-3, 4)]
+
+                max_matches = -1
+                for dyaw in fine_yaws:
+                    cos_a = math.cos(dyaw)
+                    sin_a = math.sin(dyaw)
+                    rotated_pts = []
+                    for p in sub_points:
+                        x, y, z, _ = p
+                        rx_rot = x * cos_a - y * sin_a
+                        ry_rot = x * sin_a + y * cos_a
+                        rotated_pts.append((rx_rot, ry_rot, z))
+
+                    for dx in fine_dxs:
+                        for dy in fine_dys:
+                            matches = 0
+                            for rx_rot, ry_rot, z in rotated_pts:
+                                rx = rx_rot + dx
+                                ry = ry_rot + dy
+                                vx = int(rx / self.voxel_size)
+                                vy = int(ry / self.voxel_size)
+                                vz = int(z / self.voxel_size)
+                                if (vx, vy, vz) in self.map_points:
+                                    matches += 1
+                            if matches > max_matches:
+                                max_matches = matches
+                                best_dx = dx
+                                best_dy = dy
+                                best_dtheta = dyaw
+
                 # Apply alignment if minimum overlap matches found
                 if max_matches >= 15:
-                    self.auto_yaw_offset += best_phi
+                    self.auto_x_offset = best_dx
+                    self.auto_y_offset = best_dy
+                    self.auto_yaw_offset = best_dtheta
                     self.get_logger().info(
-                        f"Auto-aligned scan yaw by {math.degrees(best_phi):.2f}° "
+                        f"Auto-aligned scan: dx={best_dx:.3f}m, dy={best_dy:.3f}m, yaw={math.degrees(best_dtheta):.2f}° "
                         f"(matched {max_matches} points with existing map)"
                     )
+                else:
+                    self.get_logger().info(
+                        f"Auto-alignment skipped: only {max_matches} matches (needs >=15)"
+                    )
 
-            # Apply cumulative alignment offset
+            # Apply cumulative alignment offset (X, Y translation and Yaw rotation)
             aligned_points = []
-            if abs(self.auto_yaw_offset) > 1e-5:
-                cos_a = math.cos(self.auto_yaw_offset)
-                sin_a = math.sin(self.auto_yaw_offset)
-                for p in raw_points:
-                    x, y, z, intensity = p
-                    rx = x * cos_a - y * sin_a
-                    ry = x * sin_a + y * cos_a
-                    aligned_points.append((rx, ry, z, intensity))
-            else:
-                aligned_points = raw_points
+            cos_a = math.cos(self.auto_yaw_offset)
+            sin_a = math.sin(self.auto_yaw_offset)
+            for p in raw_points:
+                x, y, z, intensity = p
+                rx = x * cos_a - y * sin_a + self.auto_x_offset
+                ry = x * sin_a + y * cos_a + self.auto_y_offset
+                aligned_points.append((rx, ry, z, intensity))
 
             # Create and publish the aligned point cloud
             aligned_cloud = pc2.create_cloud(cloud_in_target_frame.header, self.map_fields, aligned_points)
