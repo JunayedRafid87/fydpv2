@@ -10,7 +10,7 @@ swapping Y and Z axes in software to correct RViz coordinate swap.
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import TransformStamped
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from tf2_ros import TransformBroadcaster
 import serial
 import math
@@ -24,7 +24,7 @@ class TiltTFBroadcaster(Node):
         # Declare parameters with defaults
         self.declare_parameter('serial_port', '/dev/ttyACM0')
         self.declare_parameter('baud_rate', 115200)
-        self.declare_parameter('parent_frame', 'map')
+        self.declare_parameter('parent_frame', 'odom')
         self.declare_parameter('child_frame', 'base_link')
 
         port = self.get_parameter('serial_port').value
@@ -37,6 +37,9 @@ class TiltTFBroadcaster(Node):
 
         # Publisher for motion gating
         self.moving_pub = self.create_publisher(Bool, '/moving', 10)
+
+        # Publisher for ESP32 state machine state
+        self.scan_state_pub = self.create_publisher(String, '/scan_state', 10)
 
         # Open serial connection to ESP32
         try:
@@ -88,11 +91,16 @@ class TiltTFBroadcaster(Node):
                     msg = Bool()
                     msg.data = (is_moving_val == 1)
                     self.moving_pub.publish(msg)
+                elif line.startswith('STATE:'):
+                    state_str = line.split(':')[1].strip()
+                    msg = String()
+                    msg.data = state_str
+                    self.scan_state_pub.publish(msg)
             except Exception:
                 pass
 
     def _broadcast_imu_orientation(self, qw, qx, qy, qz):
-        """Broadcast the IMU orientation as map -> base_link (stationary base)."""
+        """Broadcast the IMU orientation as odom -> base_link (stationary base)."""
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = self.parent_frame

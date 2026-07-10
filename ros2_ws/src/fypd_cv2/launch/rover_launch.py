@@ -1,9 +1,14 @@
+import os
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 
 def generate_launch_description():
+    pkg_share = get_package_share_directory('fypd_cv2')
+    slam_params_file = os.path.join(pkg_share, 'config', 'slam_toolbox_params.yaml')
+
     return LaunchDescription([
         # ── Arguments ──
         DeclareLaunchArgument(
@@ -55,9 +60,29 @@ def generate_launch_description():
             parameters=[{
                 'serial_port': LaunchConfiguration('serial_port_esp32'),
                 'baud_rate': 115200,
-                'parent_frame': 'map',
+                'parent_frame': 'odom',
                 'child_frame': 'base_link',
             }],
+            output='screen',
+        ),
+
+        # ── 5. Scan Filter Node (removes tilted scans from slam_toolbox) ──
+        Node(
+            package='fypd_cv2',
+            executable='scan_filter_node',
+            name='scan_filter_node',
+            output='screen',
+        ),
+
+        # ── 6. Slam Toolbox (pure LiDAR 2D SLAM tracking odom -> map) ──
+        Node(
+            package='slam_toolbox',
+            executable='async_slam_toolbox_node',
+            name='slam_toolbox',
+            parameters=[
+                slam_params_file,
+                {'use_sim_time': False}
+            ],
             output='screen',
         ),
     ])

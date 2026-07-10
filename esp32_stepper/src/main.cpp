@@ -219,5 +219,13 @@ void loop() {
 
         printBoth("MOVING:");
         printlnBoth(isMovingReport ? 1 : 0);
+
+        printBoth("STATE:");
+        switch (currentState) {
+            case STATE_MOVING:        printlnBoth("MOVING"); break;
+            case STATE_STABILIZING:   printlnBoth("STABILIZING"); break;
+            case STATE_SCANNING:      printlnBoth("SCANNING"); break;
+            case STATE_SCAN_COMPLETE: printlnBoth("SCAN_COMPLETE"); break;
+        }
     }
 }

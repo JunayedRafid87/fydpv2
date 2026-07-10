@@ -2,22 +2,25 @@
 """
 Scan to PointCloud2 Converter & Map Accumulator — FYDP Cv2
 =========================================================
-Converts 2D LaserScan messages into 3D PointCloud2 using TF transforms,
-aligns them using auto-correlation scan matching on stop, and accumulates
-them into a persistent 3D voxel map.
+Converts 2D LaserScan messages into 3D PointCloud2 using TF transforms
+(slam_toolbox provides map→odom, IMU provides odom→base_link, etc.)
+and accumulates them into a persistent 3D voxel map.
+
+Sweep accumulation is gated by /scan_state:
+  SCANNING     → accumulate into both sweep_points and map_points
+  SCAN_COMPLETE → publish sweep_points as /sweep_3d, clear sweep buffer
+  MOVING / STABILIZING → accumulate into map_points only
 """
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan, PointCloud2, PointField
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
-from geometry_msgs.msg import PoseWithCovarianceStamped
 from tf2_ros import Buffer, TransformListener
 from laser_geometry import LaserProjection
 import tf2_sensor_msgs
 import sensor_msgs_py.point_cloud2 as pc2
-import math
 
 
 class ScanToPointCloud(Node):
@@ -27,59 +30,54 @@ class ScanToPointCloud(Node):
         self.declare_parameter('target_frame', 'map')
         self.target_frame = self.get_parameter('target_frame').value
 
-        # Parameters for point cloud accumulation and saving
         self.declare_parameter('voxel_size', 0.02)
-        self.declare_parameter('enable_motion_gating', False)
         self.declare_parameter('invert_z', False)
 
-        # 90-Degree Overwrite Prevention parameters
-        self.declare_parameter('prevent_overwrite', True)
-        self.declare_parameter('stable_hit_threshold', 5)
-        self.declare_parameter('neighbor_search_radius', 3)
-
         self.voxel_size = self.get_parameter('voxel_size').value
-        self.enable_motion_gating = self.get_parameter('enable_motion_gating').value
         self.invert_z = self.get_parameter('invert_z').value
-        self.prevent_overwrite = self.get_parameter('prevent_overwrite').value
-        self.stable_hit_threshold = self.get_parameter('stable_hit_threshold').value
-        self.neighbor_search_radius = self.get_parameter('neighbor_search_radius').value
 
         # TF2 buffer and listener
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        # Yaw and translation alignment calibration variables
-        self.auto_yaw_offset = 0.0
-        self.auto_x_offset = 0.0
-        self.auto_y_offset = 0.0
-        self.needs_alignment = False
 
         # Laser projection utility
         self.laser_projector = LaserProjection()
 
-        # Storage for voxel-filtered accumulated map points
-        # key: (vx, vy, vz), value: [x, y, z, intensity, hit_count]
+        # Global accumulated map — key: (vx, vy, vz), value: [x, y, z, intensity]
         self.map_points = {}
-        self.map_points_2d = set()  # 2D projection set of occupied keys: (vx, vy)
+
+        # Sweep buffer — same voxel structure, accumulated only during SCANNING
+        self.sweep_points = {}
+
         self.scan_count = 0
 
-        # Subscribe to 2D scan, publish 3D cloud (individual scans)
+        # Current scan state (from stepper controller)
+        self.scan_state = ''
+
+        # Subscribe to 2D scan
         self.scan_sub = self.create_subscription(
             LaserScan, '/scan', self.scan_callback, 10)
+
+        # Publish per-scan 3D cloud (for RViz visualization)
         self.cloud_pub = self.create_publisher(
             PointCloud2, '/pointcloud_3d', 10)
 
-        # Publish the accumulated persistent map
+        # Publish the accumulated persistent global map
         self.map_pub = self.create_publisher(
             PointCloud2, '/map_3d', 10)
+
+        # Publish completed sweep point cloud
+        self.sweep_pub = self.create_publisher(
+            PointCloud2, '/sweep_3d', 10)
 
         # Subscribe to motion gating topic
         self.moving_sub = self.create_subscription(
             Bool, '/moving', self.moving_callback, 10)
         self.is_moving = False
 
-        # Subscribe to RViz 2D Pose Estimate for manual initial alignment
-        self.initialpose_sub = self.create_subscription(
-            PoseWithCovarianceStamped, '/initialpose', self.initialpose_callback, 10)
+        # Subscribe to scan state from stepper controller
+        self.state_sub = self.create_subscription(
+            String, '/scan_state', self.state_callback, 10)
 
         # Service to clear/delete the accumulated map
         self.clear_service = self.create_service(
@@ -99,46 +97,30 @@ class ScanToPointCloud(Node):
 
     def clear_map_callback(self, request, response):
         self.map_points = {}
-        self.map_points_2d = set()
-        self.auto_yaw_offset = 0.0
-        self.auto_x_offset = 0.0
-        self.auto_y_offset = 0.0
+        self.sweep_points = {}
         response.success = True
-        response.message = "Map and alignment offsets cleared."
+        response.message = "Map and sweep buffer cleared."
         return response
 
-    def initialpose_callback(self, msg):
-        # Extract X and Y position
-        x = msg.pose.pose.position.x
-        y = msg.pose.pose.position.y
-        
-        # Convert orientation quaternion to Yaw angle
-        q = msg.pose.pose.orientation
-        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
-        
-        self.auto_x_offset = x
-        self.auto_y_offset = y
-        self.auto_yaw_offset = yaw
-        
-        self.get_logger().info(
-            f"Reset tracking origin from 2D Pose Estimate: x={x:.3f}m, y={y:.3f}m, yaw={math.degrees(yaw):.2f}°"
-        )
-
     def moving_callback(self, msg):
-        # Trigger alignment search when transitioned from moving to stationary
-        if self.is_moving and not msg.data:
-            self.needs_alignment = True
-            self.get_logger().info("Rover became stationary. Triggering auto-alignment check on next scan...")
         self.is_moving = msg.data
+
+    def state_callback(self, msg):
+        new_state = msg.data.strip()
+        prev_state = self.scan_state
+
+        # Detect transition into SCAN_COMPLETE
+        if new_state == 'SCAN_COMPLETE' and prev_state != 'SCAN_COMPLETE':
+            self.publish_sweep()
+
+        self.scan_state = new_state
 
     def scan_callback(self, scan_msg):
         try:
-            # 1. Project the LaserScan into a PointCloud2 in its own frame (e.g. 'laser')
+            # 1. Project the LaserScan into a PointCloud2 in its own frame
             cloud_in_laser_frame = self.laser_projector.projectLaser(scan_msg)
 
-            # 2. Lookup the transform from the laser frame to the target frame
+            # 2. Lookup the transform from laser frame to target frame (map)
             try:
                 transform = self.tf_buffer.lookup_transform(
                     self.target_frame,
@@ -158,7 +140,7 @@ class ScanToPointCloud(Node):
             cloud_in_target_frame = tf2_sensor_msgs.do_transform_cloud(
                 cloud_in_laser_frame, transform)
 
-            # Read raw points from the transformed cloud and cast them to Python tuples
+            # Read raw points from the transformed cloud
             raw_points = [
                 tuple(p) for p in pc2.read_points(
                     cloud_in_target_frame,
@@ -167,129 +149,41 @@ class ScanToPointCloud(Node):
                 )
             ]
 
-            # Perform regularized 2D projected scan-matching tracking (Laser Odometry) on every scan
-            if self.map_points_2d:
-                best_dx = self.auto_x_offset
-                best_dy = self.auto_y_offset
-                best_dtheta = self.auto_yaw_offset
-                max_score = -999.0
-                sub_points = raw_points[::10]  # Subsample for real-time 15 Hz tracking speed
+            # Publish per-scan point cloud for RViz
+            per_scan_cloud = pc2.create_cloud(
+                cloud_in_target_frame.header, self.map_fields, raw_points)
+            self.cloud_pub.publish(per_scan_cloud)
 
-                # Search range: X/Y translation +/- 12cm (2cm steps), Yaw rotation +/- 4.0 deg (1.0 deg steps)
-                search_dxs = [self.auto_x_offset + x * 0.02 for x in range(-6, 7)]
-                search_dys = [self.auto_y_offset + y * 0.02 for y in range(-6, 7)]
-                search_yaws = [self.auto_yaw_offset + math.radians(deg) for deg in range(-4, 5)]
-
-                for dyaw in search_yaws:
-                    cos_a = math.cos(dyaw)
-                    sin_a = math.sin(dyaw)
-                    # Pre-calculate rotated coordinates
-                    rotated_pts = []
-                    for p in sub_points:
-                        x, y, _, _ = p
-                        rx_rot = x * cos_a - y * sin_a
-                        ry_rot = x * sin_a + y * cos_a
-                        rotated_pts.append((rx_rot, ry_rot))
-
-                    for dx in search_dxs:
-                        for dy in search_dys:
-                            matches = 0
-                            for rx_rot, ry_rot in rotated_pts:
-                                rx = rx_rot + dx
-                                ry = ry_rot + dy
-                                vx = int(rx / self.voxel_size)
-                                vy = int(ry / self.voxel_size)
-                                if (vx, vy) in self.map_points_2d:
-                                    matches += 1
-
-                            # Compute distance and yaw differences from current offsets (regularization)
-                            dist_sq = (dx - self.auto_x_offset)**2 + (dy - self.auto_y_offset)**2
-                            yaw_diff = abs(dyaw - self.auto_yaw_offset)
-                            
-                            # Penalized score function
-                            score = matches - 60.0 * dist_sq - 5.0 * yaw_diff
-
-                            if score > max_score:
-                                max_score = score
-                                best_dx = dx
-                                best_dy = dy
-                                best_dtheta = dyaw
-
-                # Apply tracking updates if the best match has sufficient overlap
-                # (corresponds to at least 6 points matched in 2D)
-                if max_score >= 4.0:
-                    self.auto_x_offset = best_dx
-                    self.auto_y_offset = best_dy
-                    self.auto_yaw_offset = best_dtheta
-                    self.get_logger().info(
-                        f"Odometry: x={self.auto_x_offset:.2f}m, y={self.auto_y_offset:.2f}m, "
-                        f"yaw={math.degrees(self.auto_yaw_offset):.1f}°",
-                        throttle_duration_sec=1.0
-                    )
-
-            # Apply cumulative alignment offset (X, Y translation and Yaw rotation)
-            aligned_points = []
-            cos_a = math.cos(self.auto_yaw_offset)
-            sin_a = math.sin(self.auto_yaw_offset)
+            # 4. Accumulate into global map (always — slam_toolbox handles positioning)
             for p in raw_points:
                 x, y, z, intensity = p
-                rx = x * cos_a - y * sin_a + self.auto_x_offset
-                ry = x * sin_a + y * cos_a + self.auto_y_offset
-                aligned_points.append((rx, ry, z, intensity))
+                if self.invert_z:
+                    z = -z
 
-            # Create and publish the aligned point cloud
-            aligned_cloud = pc2.create_cloud(cloud_in_target_frame.header, self.map_fields, aligned_points)
-            self.cloud_pub.publish(aligned_cloud)
+                vx = int(x / self.voxel_size)
+                vy = int(y / self.voxel_size)
+                vz = int(z / self.voxel_size)
+                key = (vx, vy, vz)
 
-            # 4. Accumulate and voxel-filter points (always maps to build continuous 2D floor plan hallways while moving)
-            should_map = True
-            if self.enable_motion_gating and self.is_moving:
-                self.get_logger().info("2D Odometry Mapping (Rover is moving...)", throttle_duration_sec=5.0)
+                if key not in self.map_points:
+                    self.map_points[key] = [float(x), float(y), float(z), float(intensity)]
 
-            if should_map:
-                for p in aligned_points:
+            # 5. Accumulate into sweep buffer only during SCANNING (and not moving)
+            if self.scan_state == 'SCANNING' and not self.is_moving:
+                for p in raw_points:
                     x, y, z, intensity = p
                     if self.invert_z:
                         z = -z
-                    
+
                     vx = int(x / self.voxel_size)
                     vy = int(y / self.voxel_size)
                     vz = int(z / self.voxel_size)
                     key = (vx, vy, vz)
-                    
-                    if key in self.map_points:
-                        # Voxel occupied: increment hit count
-                        self.map_points[key][4] += 1
-                    else:
-                        if self.prevent_overwrite:
-                            # Avoid adding ghost double-walls from small IMU drifts:
-                            # Search neighborhood of given radius
-                            has_stable_neighbor = False
-                            r = self.neighbor_search_radius
-                            for dx in range(-r, r + 1):
-                                for dy in range(-r, r + 1):
-                                    for dz in range(-r, r + 1):
-                                        if dx == 0 and dy == 0 and dz == 0:
-                                            continue
-                                        neighbor_key = (vx + dx, vy + dy, vz + dz)
-                                        if neighbor_key in self.map_points:
-                                            # Check if neighbor has reached stable hit count
-                                            if self.map_points[neighbor_key][4] >= self.stable_hit_threshold:
-                                                has_stable_neighbor = True
-                                                break
-                                    if has_stable_neighbor:
-                                        break
-                                if has_stable_neighbor:
-                                    break
-                            
-                            if has_stable_neighbor:
-                                continue  # Reject point, too close to a stable existing surface
-                        
-                        # Add new voxel point with hit count = 1
-                        self.map_points[key] = [float(x), float(y), float(z), float(intensity), 1]
-                        self.map_points_2d.add((vx, vy))
 
-            # 5. Periodically publish the accumulated map (every 10 scans)
+                    if key not in self.sweep_points:
+                        self.sweep_points[key] = [float(x), float(y), float(z), float(intensity)]
+
+            # 6. Periodically publish the accumulated map (every 10 scans)
             self.scan_count += 1
             if self.scan_count % 10 == 0:
                 self.publish_map(cloud_in_target_frame.header)
@@ -302,12 +196,37 @@ class ScanToPointCloud(Node):
         if not self.map_points:
             return
         try:
-            # Strip the hit_count element before constructing PointCloud2
-            points_list = [p[:4] for p in self.map_points.values()]
+            points_list = list(self.map_points.values())
             map_msg = pc2.create_cloud(header, self.map_fields, points_list)
             self.map_pub.publish(map_msg)
         except Exception as e:
             self.get_logger().error(f"Failed to publish accumulated map: {e}")
+
+    def publish_sweep(self):
+        """Publish the accumulated sweep and clear the buffer."""
+        if not self.sweep_points:
+            self.get_logger().warn("SCAN_COMPLETE received but sweep buffer is empty.")
+            return
+
+        num_points = len(self.sweep_points)
+        self.get_logger().info(
+            f"SCAN_COMPLETE: publishing sweep with {num_points} voxel points.")
+
+        try:
+            from builtin_interfaces.msg import Time as TimeMsg
+            header = PointCloud2().header
+            header.frame_id = self.target_frame
+            now = self.get_clock().now().to_msg()
+            header.stamp = now
+
+            points_list = list(self.sweep_points.values())
+            sweep_msg = pc2.create_cloud(header, self.map_fields, points_list)
+            self.sweep_pub.publish(sweep_msg)
+
+            # Clear the sweep buffer for the next scan
+            self.sweep_points = {}
+        except Exception as e:
+            self.get_logger().error(f"Failed to publish sweep: {e}")
 
 
 def main(args=None):

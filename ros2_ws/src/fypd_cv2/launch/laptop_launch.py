@@ -25,4 +25,12 @@ def generate_launch_description():
             }],
             output='screen',
         ),
+
+        # ── 2. GICP Registration Node ──
+        Node(
+            package='fypd_cv2',
+            executable='gicp_registrator',
+            name='gicp_registrator',
+            output='screen',
+        ),
     ])
