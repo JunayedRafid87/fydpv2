@@ -1,45 +1,46 @@
 #!/usr/bin/env python3
 """
-Tilt TF Broadcaster — FYDP Cv2
-==============================
-Reads tilt angle and orientation from ESP32 serial port.
-Broadcasts static translation (no drift) with IMU orientation rotation,
-swapping Y and Z axes in software to correct RViz coordinate swap.
+Hardware Interface Node — FYDP Cv2
+==================================
+Reads tilt angle, IMU orientation, and movement status from the ESP32 serial port.
+- Broadcasts the dynamic TF: base_link ➔ base_link_stabilized (IMU pitch/roll, zero translation and yaw).
+- Publishes /joint_states (sensor_msgs/JointState) containing the stepper position in radians for nema_pitch_joint.
+- Publishes /imu/data (sensor_msgs/Imu) with the current BNO055 orientation.
+- Publishes /moving (std_msgs/Bool) and /scan_state (std_msgs/String).
 """
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import TransformStamped
 from std_msgs.msg import Bool, String
+from sensor_msgs.msg import JointState, Imu
 from tf2_ros import TransformBroadcaster
 import serial
 import math
 import threading
 
 
-class TiltTFBroadcaster(Node):
+class HardwareInterfaceNode(Node):
     def __init__(self):
-        super().__init__('tilt_tf_broadcaster')
+        super().__init__('hardware_interface')
 
         # Declare parameters with defaults
         self.declare_parameter('serial_port', '/dev/ttyACM0')
         self.declare_parameter('baud_rate', 115200)
-        self.declare_parameter('parent_frame', 'odom')
-        self.declare_parameter('child_frame', 'base_link')
+        self.declare_parameter('invert_stepper', False)
 
         port = self.get_parameter('serial_port').value
         baud = self.get_parameter('baud_rate').value
-        self.parent_frame = self.get_parameter('parent_frame').value
-        self.child_frame = self.get_parameter('child_frame').value
+        self.invert_stepper = self.get_parameter('invert_stepper').value
 
-        # TF broadcaster
+        # TF broadcaster for base_link ➔ base_link_stabilized
         self.tf_broadcaster = TransformBroadcaster(self)
 
-        # Publisher for motion gating
+        # Publishers
+        self.joint_state_pub = self.create_publisher(JointState, '/joint_states', 10)
+        self.imu_pub = self.create_publisher(Imu, '/imu/data', 10)
         self.moving_pub = self.create_publisher(Bool, '/moving', 10)
-
-        # Publisher for ESP32 state machine state
-        self.scan_state_pub = self.create_publisher(String, '/scan_state', 10)
+        self.state_pub = self.create_publisher(String, '/scan_state', 10)
 
         # Open serial connection to ESP32
         try:
@@ -65,7 +66,7 @@ class TiltTFBroadcaster(Node):
         self.serial_thread.start()
 
     def _serial_reader(self):
-        """Continuously read serial data and broadcast TFs."""
+        """Continuously read serial data and publish topics."""
         while self.running and rclpy.ok():
             try:
                 if not self.ser.is_open:
@@ -82,61 +83,93 @@ class TiltTFBroadcaster(Node):
                     qz = float(parts[3])
                     
                     if not (math.isnan(qw) or math.isnan(qx) or math.isnan(qy) or math.isnan(qz)):
-                        self._broadcast_imu_orientation(qw, qx, qy, qz)
+                        self._handle_imu(qw, qx, qy, qz)
                 elif line.startswith('STEP:'):
                     angle_deg = float(line.split(':')[1])
-                    self._broadcast_stepper_tilt(angle_deg)
+                    self._handle_stepper(angle_deg)
                 elif line.startswith('MOVING:'):
                     is_moving_val = int(line.split(':')[1])
                     msg = Bool()
                     msg.data = (is_moving_val == 1)
                     self.moving_pub.publish(msg)
                 elif line.startswith('STATE:'):
-                    state_str = line.split(':')[1].strip()
+                    state_str = line.split(':')[1]
                     msg = String()
                     msg.data = state_str
-                    self.scan_state_pub.publish(msg)
-            except Exception:
-                pass
+                    self.state_pub.publish(msg)
+            except Exception as e:
+                self.get_logger().error(f"Error in serial reader: {e}", throttle_duration_sec=5.0)
 
-    def _broadcast_imu_orientation(self, qw, qx, qy, qz):
-        """Broadcast the IMU orientation as odom -> base_link (stationary base)."""
+    def _handle_imu(self, qw, qx, qy, qz):
+        """Publish /imu/data and broadcast base_link ➔ base_link_stabilized."""
+        now_msg = self.get_clock().now().to_msg()
+
+        # 1. Publish standard Imu message
+        imu_msg = Imu()
+        imu_msg.header.stamp = now_msg
+        imu_msg.header.frame_id = 'base_link'
+        
+        imu_msg.orientation.w = qw
+        imu_msg.orientation.x = qx
+        imu_msg.orientation.y = qy
+        imu_msg.orientation.z = qz
+
+        # Orientation covariance (very low since it is pre-fused on BNO055)
+        imu_msg.orientation_covariance = [0.001] * 9
+        # No linear accel and angular velocity, set covariance diagonal to -1
+        imu_msg.angular_velocity_covariance = [-1.0] * 9
+        imu_msg.linear_acceleration_covariance = [-1.0] * 9
+
+        self.imu_pub.publish(imu_msg)
+
+        # 2. Extract roll and pitch to broadcast base_link ➔ base_link_stabilized (yaw zeroed out)
+        sinr_cosp = 2.0 * (qw * qx + qy * qz)
+        cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
+        roll = math.atan2(sinr_cosp, cosr_cosp)
+
+        sinp = 2.0 * (qw * qy - qz * qx)
+        if abs(sinp) >= 1.0:
+            pitch = math.copysign(math.pi / 2.0, sinp)
+        else:
+            pitch = math.asin(sinp)
+
+        # Rebuild quaternion with yaw = 0
+        cp = math.cos(pitch / 2.0)
+        sp = math.sin(pitch / 2.0)
+        cr = math.cos(roll / 2.0)
+        sr = math.sin(roll / 2.0)
+
         t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = self.parent_frame
-        t.child_frame_id = self.child_frame
+        t.header.stamp = now_msg
+        t.header.frame_id = 'base_link'
+        t.child_frame_id = 'base_link_stabilized'
 
-        # Flat translation (no Z climbing, no sliding drift)
         t.transform.translation.x = 0.0
         t.transform.translation.y = 0.0
         t.transform.translation.z = 0.0
 
-        t.transform.rotation.w = qw
-        t.transform.rotation.x = qx
-        t.transform.rotation.y = qy
-        t.transform.rotation.z = qz
+        t.transform.rotation.w = cr * cp
+        t.transform.rotation.x = sr * cp
+        t.transform.rotation.y = cr * sp
+        t.transform.rotation.z = -sr * sp
 
         self.tf_broadcaster.sendTransform(t)
 
-    def _broadcast_stepper_tilt(self, angle_deg):
-        """Broadcast transform from base_link to tilt_link based on stepper motor tilt."""
-        t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = self.child_frame
-        t.child_frame_id = 'tilt_link'
+    def _handle_stepper(self, angle_deg):
+        """Publish /joint_states containing the nema_pitch_joint position in radians."""
+        if self.invert_stepper:
+            angle_deg = -angle_deg
 
-        t.transform.translation.x = 0.0
-        t.transform.translation.y = 0.0
-        t.transform.translation.z = 0.05  # 5cm above base origin
-
-        # Stepper tilt rotation around Y-axis
         angle_rad = math.radians(angle_deg)
-        t.transform.rotation.w = math.cos(angle_rad / 2.0)
-        t.transform.rotation.x = 0.0
-        t.transform.rotation.y = math.sin(angle_rad / 2.0)
-        t.transform.rotation.z = 0.0
 
-        self.tf_broadcaster.sendTransform(t)
+        js = JointState()
+        js.header.stamp = self.get_clock().now().to_msg()
+        js.name = ['nema_pitch_joint']
+        js.position = [angle_rad]
+        js.velocity = []
+        js.effort = []
+
+        self.joint_state_pub.publish(js)
 
     def destroy_node(self):
         self.running = False
@@ -147,7 +180,7 @@ class TiltTFBroadcaster(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = TiltTFBroadcaster()
+    node = HardwareInterfaceNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

@@ -14,9 +14,8 @@ setup(
             'launch/rover_launch.py',
             'launch/laptop_launch.py'
         ]),
-        ('share/' + package_name + '/config', [
-            'config/slam_toolbox_params.yaml'
-        ]),
+        ('share/' + package_name + '/urdf', ['urdf/rover.urdf']),
+        ('share/' + package_name + '/config', ['config/cartographer_2d.lua']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -28,8 +27,7 @@ setup(
         'console_scripts': [
             'tilt_tf_broadcaster = fypd_cv2.tilt_tf_broadcaster:main',
             'scan_to_pointcloud = fypd_cv2.scan_to_pointcloud:main',
-            'scan_filter_node = fypd_cv2.scan_filter_node:main',
-            'gicp_registrator = fypd_cv2.gicp_registrator:main',
+            'scan_mux_node = fypd_cv2.scan_mux_node:main',
         ],
     },
 )

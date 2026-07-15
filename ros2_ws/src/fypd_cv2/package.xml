@@ -13,8 +13,6 @@
   <depend>std_msgs</depend>
   <depend>tf2_ros</depend>
   <depend>laser_geometry</depend>
-  <depend>slam_toolbox</depend>
-  <depend>std_srvs</depend>
 
   <buildtool_depend>ament_python</buildtool_depend>
 

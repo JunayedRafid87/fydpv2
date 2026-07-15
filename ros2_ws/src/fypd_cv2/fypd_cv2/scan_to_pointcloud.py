@@ -2,25 +2,20 @@
 """
 Scan to PointCloud2 Converter & Map Accumulator — FYDP Cv2
 =========================================================
-Converts 2D LaserScan messages into 3D PointCloud2 using TF transforms
-(slam_toolbox provides map→odom, IMU provides odom→base_link, etc.)
-and accumulates them into a persistent 3D voxel map.
-
-Sweep accumulation is gated by /scan_state:
-  SCANNING     → accumulate into both sweep_points and map_points
-  SCAN_COMPLETE → publish sweep_points as /sweep_3d, clear sweep buffer
-  MOVING / STABILIZING → accumulate into map_points only
+Converts 2D LaserScan messages into 3D PointCloud2 using dynamic TF transforms,
+and accumulates them into a persistent 3D voxel map only during scanning sweeps.
 """
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan, PointCloud2, PointField
-from std_msgs.msg import Bool, String
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformListener
 from laser_geometry import LaserProjection
 import tf2_sensor_msgs
 import sensor_msgs_py.point_cloud2 as pc2
+import math
 
 
 class ScanToPointCloud(Node):
@@ -30,6 +25,7 @@ class ScanToPointCloud(Node):
         self.declare_parameter('target_frame', 'map')
         self.target_frame = self.get_parameter('target_frame').value
 
+        # Parameters for point cloud accumulation
         self.declare_parameter('voxel_size', 0.02)
         self.declare_parameter('invert_z', False)
 
@@ -43,41 +39,25 @@ class ScanToPointCloud(Node):
         # Laser projection utility
         self.laser_projector = LaserProjection()
 
-        # Global accumulated map — key: (vx, vy, vz), value: [x, y, z, intensity]
+        # Storage for voxel-filtered accumulated map points
+        # key: (vx, vy, vz), value: [x, y, z, intensity]
         self.map_points = {}
-
-        # Sweep buffer — same voxel structure, accumulated only during SCANNING
-        self.sweep_points = {}
-
         self.scan_count = 0
 
-        # Current scan state (from stepper controller)
-        self.scan_state = ''
-
-        # Subscribe to 2D scan
+        # Subscriptions
         self.scan_sub = self.create_subscription(
             LaserScan, '/scan', self.scan_callback, 10)
+        self.state_sub = self.create_subscription(
+            String, '/scan_state', self.state_callback, 10)
 
-        # Publish per-scan 3D cloud (for RViz visualization)
+        # Publishers
         self.cloud_pub = self.create_publisher(
             PointCloud2, '/pointcloud_3d', 10)
-
-        # Publish the accumulated persistent global map
         self.map_pub = self.create_publisher(
             PointCloud2, '/map_3d', 10)
 
-        # Publish completed sweep point cloud
-        self.sweep_pub = self.create_publisher(
-            PointCloud2, '/sweep_3d', 10)
-
-        # Subscribe to motion gating topic
-        self.moving_sub = self.create_subscription(
-            Bool, '/moving', self.moving_callback, 10)
-        self.is_moving = False
-
-        # Subscribe to scan state from stepper controller
-        self.state_sub = self.create_subscription(
-            String, '/scan_state', self.state_callback, 10)
+        # State tracking
+        self.current_state = "MOVING"
 
         # Service to clear/delete the accumulated map
         self.clear_service = self.create_service(
@@ -92,35 +72,24 @@ class ScanToPointCloud(Node):
         ]
 
         self.get_logger().info('ScanToPointCloud node started')
-        self.get_logger().info(f'Projecting scans into frame: {self.target_frame}')
+        self.get_logger().info(f'Projecting scans into target frame: {self.target_frame}')
         self.get_logger().info(f'Voxel filter resolution set to: {self.voxel_size}m')
 
     def clear_map_callback(self, request, response):
         self.map_points = {}
-        self.sweep_points = {}
         response.success = True
-        response.message = "Map and sweep buffer cleared."
+        response.message = "Accumulated 3D map cleared."
         return response
 
-    def moving_callback(self, msg):
-        self.is_moving = msg.data
-
     def state_callback(self, msg):
-        new_state = msg.data.strip()
-        prev_state = self.scan_state
-
-        # Detect transition into SCAN_COMPLETE
-        if new_state == 'SCAN_COMPLETE' and prev_state != 'SCAN_COMPLETE':
-            self.publish_sweep()
-
-        self.scan_state = new_state
+        self.current_state = msg.data.upper()
 
     def scan_callback(self, scan_msg):
         try:
-            # 1. Project the LaserScan into a PointCloud2 in its own frame
+            # 1. Project the LaserScan into a PointCloud2 in its own frame (e.g. 'laser')
             cloud_in_laser_frame = self.laser_projector.projectLaser(scan_msg)
 
-            # 2. Lookup the transform from laser frame to target frame (map)
+            # 2. Lookup the transform from the laser frame to the target frame (typically 'map')
             try:
                 transform = self.tf_buffer.lookup_transform(
                     self.target_frame,
@@ -136,11 +105,11 @@ class ScanToPointCloud(Node):
                     rclpy.duration.Duration(seconds=0.05)
                 )
 
-            # 3. Transform the PointCloud2 into the target frame
+            # 3. Transform the PointCloud2 into the target frame (resolving IMU + stepper tilt + SLAM pose)
             cloud_in_target_frame = tf2_sensor_msgs.do_transform_cloud(
                 cloud_in_laser_frame, transform)
 
-            # Read raw points from the transformed cloud
+            # Read raw points from the transformed cloud and cast them to Python tuples
             raw_points = [
                 tuple(p) for p in pc2.read_points(
                     cloud_in_target_frame,
@@ -149,41 +118,31 @@ class ScanToPointCloud(Node):
                 )
             ]
 
-            # Publish per-scan point cloud for RViz
-            per_scan_cloud = pc2.create_cloud(
-                cloud_in_target_frame.header, self.map_fields, raw_points)
-            self.cloud_pub.publish(per_scan_cloud)
-
-            # 4. Accumulate into global map (always — slam_toolbox handles positioning)
+            # Create and publish the single-scan point cloud for real-time visual painting
+            aligned_points = []
             for p in raw_points:
                 x, y, z, intensity = p
                 if self.invert_z:
                     z = -z
+                aligned_points.append((x, y, z, intensity))
 
-                vx = int(x / self.voxel_size)
-                vy = int(y / self.voxel_size)
-                vz = int(z / self.voxel_size)
-                key = (vx, vy, vz)
+            aligned_cloud = pc2.create_cloud(cloud_in_target_frame.header, self.map_fields, aligned_points)
+            aligned_cloud.header.frame_id = self.target_frame
+            self.cloud_pub.publish(aligned_cloud)
 
-                if key not in self.map_points:
-                    self.map_points[key] = [float(x), float(y), float(z), float(intensity)]
-
-            # 5. Accumulate into sweep buffer only during SCANNING (and not moving)
-            if self.scan_state == 'SCANNING' and not self.is_moving:
-                for p in raw_points:
+            # 4. Accumulate points into the 3D map ONLY during stationary active sweeps (SCANNING state)
+            if self.current_state == "SCANNING":
+                for p in aligned_points:
                     x, y, z, intensity = p
-                    if self.invert_z:
-                        z = -z
-
                     vx = int(x / self.voxel_size)
                     vy = int(y / self.voxel_size)
                     vz = int(z / self.voxel_size)
                     key = (vx, vy, vz)
+                    
+                    # Store unique voxel point
+                    self.map_points[key] = [float(x), float(y), float(z), float(intensity)]
 
-                    if key not in self.sweep_points:
-                        self.sweep_points[key] = [float(x), float(y), float(z), float(intensity)]
-
-            # 6. Periodically publish the accumulated map (every 10 scans)
+            # 5. Periodically publish the accumulated map (every 10 scans)
             self.scan_count += 1
             if self.scan_count % 10 == 0:
                 self.publish_map(cloud_in_target_frame.header)
@@ -198,35 +157,10 @@ class ScanToPointCloud(Node):
         try:
             points_list = list(self.map_points.values())
             map_msg = pc2.create_cloud(header, self.map_fields, points_list)
+            map_msg.header.frame_id = self.target_frame
             self.map_pub.publish(map_msg)
         except Exception as e:
             self.get_logger().error(f"Failed to publish accumulated map: {e}")
-
-    def publish_sweep(self):
-        """Publish the accumulated sweep and clear the buffer."""
-        if not self.sweep_points:
-            self.get_logger().warn("SCAN_COMPLETE received but sweep buffer is empty.")
-            return
-
-        num_points = len(self.sweep_points)
-        self.get_logger().info(
-            f"SCAN_COMPLETE: publishing sweep with {num_points} voxel points.")
-
-        try:
-            from builtin_interfaces.msg import Time as TimeMsg
-            header = PointCloud2().header
-            header.frame_id = self.target_frame
-            now = self.get_clock().now().to_msg()
-            header.stamp = now
-
-            points_list = list(self.sweep_points.values())
-            sweep_msg = pc2.create_cloud(header, self.map_fields, points_list)
-            self.sweep_pub.publish(sweep_msg)
-
-            # Clear the sweep buffer for the next scan
-            self.sweep_points = {}
-        except Exception as e:
-            self.get_logger().error(f"Failed to publish sweep: {e}")
 
 
 def main(args=None):

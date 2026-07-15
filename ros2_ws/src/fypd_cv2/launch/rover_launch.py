@@ -6,8 +6,12 @@ from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 
 def generate_launch_description():
+    # Path to URDF model
     pkg_share = get_package_share_directory('fypd_cv2')
-    slam_params_file = os.path.join(pkg_share, 'config', 'slam_toolbox_params.yaml')
+    urdf_file = os.path.join(pkg_share, 'urdf', 'rover.urdf')
+    
+    with open(urdf_file, 'r') as infp:
+        robot_desc = infp.read()
 
     return LaunchDescription([
         # ── Arguments ──
@@ -17,8 +21,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'serial_port_esp32', default_value='/dev/ttyACM0',
             description='Serial port for ESP32-S3'),
+        DeclareLaunchArgument(
+            'invert_stepper', default_value='False',
+            description='Invert stepper tilt direction'),
 
-        # ── 1. RPLiDAR C1 Driver (at 12 Hz scan rate) ──
+        # ── 1. RPLiDAR C1 Driver (at 15 Hz scan rate) ──
         Node(
             package='rplidar_ros',
             executable='rplidar_composition',
@@ -30,21 +37,21 @@ def generate_launch_description():
                 'frame_id': 'laser',
                 'angle_compensate': True,
                 'scan_mode': 'DenseBoost',
-                'scan_frequency': 15.0,   # Set scan frequency to 15.0 Hz
+                'scan_frequency': 15.0,
             }],
             output='screen',
         ),
 
-        # ── 2. Static TF: tilt_link → laser ──
-        #    Old-style positional args for Humble: x y z yaw pitch roll frame_id child_frame_id
+        # ── 2. Robot State Publisher (TF base_link_stabilized ➔ laser) ──
         Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name='tilt_to_laser_tf',
-            arguments=['0', '0', '0', '0', '0', '0', 'tilt_link', 'laser'],
+            package='robot_state_publisher',
+            executable='robot_state_publisher',
+            name='robot_state_publisher',
+            parameters=[{'robot_description': robot_desc}],
+            output='screen',
         ),
 
-        # ── 3. Static TF: base_link → thermal_camera_link ──
+        # ── 3. Static TF: base_link ➔ thermal_camera_link ──
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
@@ -52,37 +59,16 @@ def generate_launch_description():
             arguments=['0.05', '0', '0.10', '0', '0', '0', 'base_link', 'thermal_camera_link'],
         ),
 
-        # ── 4. Tilt Angle and Orientation TF Broadcaster ──
+        # ── 4. Hardware Interface Node (serial data and base_link ➔ base_link_stabilized TF) ──
         Node(
             package='fypd_cv2',
-            executable='tilt_tf_broadcaster',
-            name='tilt_tf_broadcaster',
+            executable='tilt_tf_broadcaster',  # maps to entrypoint for HardwareInterfaceNode
+            name='hardware_interface',
             parameters=[{
                 'serial_port': LaunchConfiguration('serial_port_esp32'),
                 'baud_rate': 115200,
-                'parent_frame': 'odom',
-                'child_frame': 'base_link',
+                'invert_stepper': LaunchConfiguration('invert_stepper'),
             }],
-            output='screen',
-        ),
-
-        # ── 5. Scan Filter Node (removes tilted scans from slam_toolbox) ──
-        Node(
-            package='fypd_cv2',
-            executable='scan_filter_node',
-            name='scan_filter_node',
-            output='screen',
-        ),
-
-        # ── 6. Slam Toolbox (pure LiDAR 2D SLAM tracking odom -> map) ──
-        Node(
-            package='slam_toolbox',
-            executable='async_slam_toolbox_node',
-            name='slam_toolbox',
-            parameters=[
-                slam_params_file,
-                {'use_sim_time': False}
-            ],
             output='screen',
         ),
     ])
